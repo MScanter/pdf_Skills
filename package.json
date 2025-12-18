@@ -1,7 +1,7 @@
 {
   "name": "pdf-skills",
-  "version": "1.0.0",
-  "description": "Claude Code skill for analyzing academic PDF documents",
+  "version": "2.0.0",
+  "description": "Claude Code skill for extracting and analyzing PDF documents",
   "type": "module",
   "scripts": {
     "pdf": "tsx src/pdf-analyzer.ts"
@@ -9,13 +9,13 @@
   "keywords": [
     "claude-code",
     "pdf",
-    "academic",
-    "analysis"
+    "extract",
+    "skill"
   ],
   "author": "",
   "license": "MIT",
   "dependencies": {
-    "@anthropic-ai/sdk": "^0.32.1",
+    "glob": "^11.0.0",
     "pdf-parse": "^1.1.1"
   },
   "devDependencies": {

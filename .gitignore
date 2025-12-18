@@ -3,3 +3,13 @@ node_modules/
 dist/
 *.log
 .DS_Store
+
+# Extracted results (keep README.md)
+extracted/*
+!extracted/README.md
+
+# Cache directory
+.cache/
+
+# Internal development documents
+STRATEGY_ANALYSIS.md

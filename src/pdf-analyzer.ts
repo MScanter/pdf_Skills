@@ -1,7 +1,24 @@
-import Anthropic from "@anthropic-ai/sdk";
 import fs from "fs";
 import path from "path";
 import pdfParse from "pdf-parse";
+import { glob } from "glob";
+import crypto from "crypto";
+
+// ==================== 配置 ====================
+
+const CONFIG = {
+  // 缓存配置
+  cache: {
+    enabled: true,
+    dir: ".cache",
+  },
+  // 并行配置
+  parallel: {
+    maxConcurrent: 3,
+  },
+};
+
+// ==================== 接口定义 ====================
 
 interface PDFMetadata {
   title?: string;
@@ -10,68 +27,84 @@ interface PDFMetadata {
   creationDate?: Date;
 }
 
-interface SummaryResult {
-  title: string;
-  abstract: string;
-  keyFindings: string[];
-  methodology?: string;
-  conclusions?: string;
-  keywords: string[];
-}
-
-interface Citation {
+interface ExtractResult {
+  pdfPath: string;
+  metadata: PDFMetadata;
   text: string;
-  authors?: string[];
-  year?: string;
-  title?: string;
+  hash: string;
+  extractedAt: string;
 }
 
-interface TableOrFigure {
-  type: "table" | "figure";
-  caption?: string;
-  pageNumber?: number;
-  content: string;
-  analysis?: string;
-}
+// ==================== PDF 提取器 ====================
 
-interface QuestionAnswer {
-  question: string;
-  answer: string;
-  confidence: "high" | "medium" | "low";
-  sources: string[];
-}
-
-class PDFAnalyzer {
-  private client: Anthropic;
+class PDFExtractor {
   private pdfPath: string;
   private pdfContent: string = "";
   private pdfMetadata: PDFMetadata = { pages: 0 };
+  private pdfHash: string = "";
 
   constructor(pdfPath: string) {
     this.pdfPath = path.resolve(pdfPath);
-
-    const apiKey = process.env.ANTHROPIC_AUTH_TOKEN || process.env.ANTHROPIC_API_KEY;
-    if (!apiKey) {
-      throw new Error("请设置 ANTHROPIC_AUTH_TOKEN 或 ANTHROPIC_API_KEY 环境变量");
-    }
-
-    this.client = new Anthropic({
-      apiKey,
-      baseURL: process.env.ANTHROPIC_BASE_URL,
-    });
   }
 
-  async loadPDF(): Promise<void> {
+  // ==================== 缓存功能 ====================
+
+  private computeHash(content: string): string {
+    return crypto.createHash("md5").update(content).digest("hex").slice(0, 12);
+  }
+
+  private getCachePath(): string {
+    const cacheDir = path.join(CONFIG.cache.dir, this.pdfHash);
+    return path.join(cacheDir, "extracted.json");
+  }
+
+  private checkCache(): ExtractResult | null {
+    if (!CONFIG.cache.enabled || !this.pdfHash) return null;
+
+    const cachePath = this.getCachePath();
+    if (fs.existsSync(cachePath)) {
+      try {
+        const cached = JSON.parse(fs.readFileSync(cachePath, "utf-8"));
+        console.log(`📦 使用缓存 (hash: ${this.pdfHash})`);
+        return cached;
+      } catch {
+        return null;
+      }
+    }
+    return null;
+  }
+
+  private saveCache(result: ExtractResult): void {
+    if (!CONFIG.cache.enabled) return;
+
+    const cacheDir = path.join(CONFIG.cache.dir, this.pdfHash);
+    if (!fs.existsSync(cacheDir)) {
+      fs.mkdirSync(cacheDir, { recursive: true });
+    }
+
+    const cachePath = this.getCachePath();
+    fs.writeFileSync(cachePath, JSON.stringify(result, null, 2), "utf-8");
+    console.log(`💾 已缓存`);
+  }
+
+  // ==================== 提取功能 ====================
+
+  /**
+   * 提取 PDF 文本内容
+   */
+  async extract(): Promise<ExtractResult> {
     if (!fs.existsSync(this.pdfPath)) {
       throw new Error(`PDF 文件不存在: ${this.pdfPath}`);
     }
 
     console.log(`正在加载 PDF: ${this.pdfPath}`);
 
+    // 读取 PDF
     const dataBuffer = fs.readFileSync(this.pdfPath);
     const data = await pdfParse(dataBuffer);
 
     this.pdfContent = data.text;
+    this.pdfHash = this.computeHash(this.pdfContent);
     this.pdfMetadata = {
       title: data.info?.Title,
       author: data.info?.Author,
@@ -79,340 +112,238 @@ class PDFAnalyzer {
       creationDate: data.info?.CreationDate,
     };
 
-    console.log(`PDF 加载完成: ${this.pdfMetadata.pages} 页, ${this.pdfContent.length} 字符\n`);
-  }
+    console.log(`PDF 加载完成: ${this.pdfMetadata.pages} 页, ${this.pdfContent.length} 字符, hash: ${this.pdfHash}`);
 
-  async extractSummary(): Promise<SummaryResult> {
-    console.log("正在提取文献摘要和关键信息...\n");
+    // 检查缓存
+    const cached = this.checkCache();
+    if (cached) return cached;
 
-    const prompt = `请仔细分析这篇学术文献，提取以下信息：
-
-1. 标题（如果 metadata 中没有，请从正文中识别）
-2. 摘要（Abstract）的完整内容
-3. 关键发现（Key Findings）- 列出 5-10 个要点
-4. 研究方法（Methodology）- 简要描述
-5. 结论（Conclusions）- 总结主要结论
-6. 关键词（Keywords）- 提取 5-8 个核心关键词
-
-请以 JSON 格式返回，格式如下：
-{
-  "title": "论文标题",
-  "abstract": "摘要内容...",
-  "keyFindings": ["发现1", "发现2", ...],
-  "methodology": "研究方法描述",
-  "conclusions": "结论总结",
-  "keywords": ["关键词1", "关键词2", ...]
-}
-
-文献内容：
-${this.pdfContent.slice(0, 50000)}`;
-
-    const response = await this.client.messages.create({
-      model: "claude-sonnet-4-5-20250929",
-      max_tokens: 4096,
-      messages: [
-        {
-          role: "user",
-          content: prompt,
-        },
-      ],
-    });
-
-    const textContent = response.content.find((block) => block.type === "text");
-    if (!textContent || textContent.type !== "text") {
-      throw new Error("未能获取分析结果");
-    }
-
-    const jsonMatch = textContent.text.match(/\{[\s\S]*\}/);
-    if (!jsonMatch) {
-      throw new Error("未能解析 JSON 结果");
-    }
-
-    return JSON.parse(jsonMatch[0]);
-  }
-
-  async extractCitations(): Promise<Citation[]> {
-    console.log("正在提取和整理参考文献...\n");
-
-    const prompt = `请从这篇学术文献中提取所有参考文献。对于每个引用，尽可能提取：
-
-1. 作者列表
-2. 发表年份
-3. 论文/书籍标题
-4. 完整引用文本
-
-请以 JSON 数组格式返回，格式如下：
-[
-  {
-    "text": "完整引用文本",
-    "authors": ["作者1", "作者2"],
-    "year": "2023",
-    "title": "论文标题"
-  },
-  ...
-]
-
-通常参考文献在文档末尾的 "References" 或 "Bibliography" 部分。
-
-文献内容：
-${this.pdfContent}`;
-
-    const response = await this.client.messages.create({
-      model: "claude-sonnet-4-5-20250929",
-      max_tokens: 8192,
-      messages: [
-        {
-          role: "user",
-          content: prompt,
-        },
-      ],
-    });
-
-    const textContent = response.content.find((block) => block.type === "text");
-    if (!textContent || textContent.type !== "text") {
-      throw new Error("未能获取引用结果");
-    }
-
-    const jsonMatch = textContent.text.match(/\[[\s\S]*\]/);
-    if (!jsonMatch) {
-      return [];
-    }
-
-    return JSON.parse(jsonMatch[0]);
-  }
-
-  async extractTablesAndFigures(): Promise<TableOrFigure[]> {
-    console.log("正在提取表格和图表信息...\n");
-
-    const prompt = `请从这篇学术文献中识别所有的表格（Tables）和图表（Figures）。对于每个表格/图表，提取：
-
-1. 类型（table 或 figure）
-2. 标题/说明（Caption）
-3. 所在页码（如果能识别）
-4. 内容描述或数据
-5. 对该表格/图表的简要分析说明
-
-请以 JSON 数组格式返回，格式如下：
-[
-  {
-    "type": "table",
-    "caption": "Table 1: Experimental Results",
-    "pageNumber": 5,
-    "content": "表格内容或描述...",
-    "analysis": "这个表格展示了..."
-  },
-  ...
-]
-
-文献内容：
-${this.pdfContent}`;
-
-    const response = await this.client.messages.create({
-      model: "claude-sonnet-4-5-20250929",
-      max_tokens: 8192,
-      messages: [
-        {
-          role: "user",
-          content: prompt,
-        },
-      ],
-    });
-
-    const textContent = response.content.find((block) => block.type === "text");
-    if (!textContent || textContent.type !== "text") {
-      throw new Error("未能获取表格图表结果");
-    }
-
-    const jsonMatch = textContent.text.match(/\[[\s\S]*\]/);
-    if (!jsonMatch) {
-      return [];
-    }
-
-    return JSON.parse(jsonMatch[0]);
-  }
-
-  async answerQuestion(question: string): Promise<QuestionAnswer> {
-    console.log(`正在回答问题: ${question}\n`);
-
-    const prompt = `基于这篇学术文献，请回答以下问题：
-
-问题：${question}
-
-要求：
-1. 仔细阅读文献内容
-2. 提供详细、准确的答案
-3. 标注答案的置信度（high/medium/low）
-4. 列出支持答案的文献片段或来源
-
-请以 JSON 格式返回：
-{
-  "question": "原问题",
-  "answer": "详细答案...",
-  "confidence": "high",
-  "sources": ["支持证据1", "支持证据2", ...]
-}
-
-文献内容：
-${this.pdfContent}`;
-
-    const response = await this.client.messages.create({
-      model: "claude-sonnet-4-5-20250929",
-      max_tokens: 4096,
-      messages: [
-        {
-          role: "user",
-          content: prompt,
-        },
-      ],
-    });
-
-    const textContent = response.content.find((block) => block.type === "text");
-    if (!textContent || textContent.type !== "text") {
-      throw new Error("未能获取回答结果");
-    }
-
-    const jsonMatch = textContent.text.match(/\{[\s\S]*\}/);
-    if (!jsonMatch) {
-      throw new Error("未能解析问答结果");
-    }
-
-    return JSON.parse(jsonMatch[0]);
-  }
-
-  async analyzeAll(): Promise<{
-    summary: SummaryResult;
-    citations: Citation[];
-    tablesAndFigures: TableOrFigure[];
-  }> {
-    await this.loadPDF();
-
-    console.log("========== 开始全面分析 ==========\n");
-
-    const summary = await this.extractSummary();
-    const citations = await this.extractCitations();
-    const tablesAndFigures = await this.extractTablesAndFigures();
-
-    return {
-      summary,
-      citations,
-      tablesAndFigures,
+    // 构建结果
+    const result: ExtractResult = {
+      pdfPath: this.pdfPath,
+      metadata: this.pdfMetadata,
+      text: this.pdfContent,
+      hash: this.pdfHash,
+      extractedAt: new Date().toISOString(),
     };
+
+    // 保存缓存
+    this.saveCache(result);
+
+    return result;
   }
 
-  getMetadata(): PDFMetadata {
-    return this.pdfMetadata;
+  /**
+   * 保存提取结果到文件
+   */
+  async saveToFile(result: ExtractResult, outputDir: string): Promise<string[]> {
+    const pdfBasename = path.basename(this.pdfPath, ".pdf");
+    const outputPath = path.join(outputDir, pdfBasename);
+
+    if (!fs.existsSync(outputPath)) {
+      fs.mkdirSync(outputPath, { recursive: true });
+    }
+
+    const savedFiles: string[] = [];
+
+    // 保存 JSON（完整信息）
+    const jsonPath = path.join(outputPath, "extracted.json");
+    fs.writeFileSync(jsonPath, JSON.stringify(result, null, 2), "utf-8");
+    savedFiles.push(jsonPath);
+    console.log(`✓ 已保存: ${jsonPath}`);
+
+    // 保存纯文本（方便 Claude Code 读取）
+    const textPath = path.join(outputPath, "content.txt");
+    fs.writeFileSync(textPath, result.text, "utf-8");
+    savedFiles.push(textPath);
+    console.log(`✓ 已保存: ${textPath}`);
+
+    // 保存元数据摘要（Markdown）
+    const mdPath = path.join(outputPath, "info.md");
+    let md = `# ${pdfBasename}\n\n`;
+    md += `**文件**: ${path.basename(result.pdfPath)}\n`;
+    md += `**页数**: ${result.metadata.pages}\n`;
+    md += `**字符数**: ${result.text.length}\n`;
+    md += `**Hash**: ${result.hash}\n`;
+    md += `**提取时间**: ${new Date(result.extractedAt).toLocaleString("zh-CN")}\n`;
+    if (result.metadata.title) md += `**标题**: ${result.metadata.title}\n`;
+    if (result.metadata.author) md += `**作者**: ${result.metadata.author}\n`;
+    md += `\n## 文件路径\n\n`;
+    md += `- 完整文本: \`${textPath}\`\n`;
+    md += `- JSON 数据: \`${jsonPath}\`\n`;
+    fs.writeFileSync(mdPath, md, "utf-8");
+    savedFiles.push(mdPath);
+    console.log(`✓ 已保存: ${mdPath}`);
+
+    return savedFiles;
   }
+
+  // ==================== 批量处理 ====================
+
+  static async batchExtract(
+    pdfPaths: string[],
+    outputDir: string
+  ): Promise<void> {
+    console.log(`\n========== 批量提取模式 ==========`);
+    console.log(`共 ${pdfPaths.length} 个 PDF 文件`);
+    console.log(`并行数: ${CONFIG.parallel.maxConcurrent}\n`);
+
+    const processOne = async (pdfPath: string, index: number): Promise<{ success: boolean; name: string; error?: string }> => {
+      const name = path.basename(pdfPath);
+      console.log(`[${index + 1}/${pdfPaths.length}] 处理: ${name}`);
+
+      try {
+        const extractor = new PDFExtractor(pdfPath);
+        const result = await extractor.extract();
+        await extractor.saveToFile(result, outputDir);
+        console.log(`✓ 完成: ${name}\n`);
+        return { success: true, name };
+      } catch (error) {
+        const errorMsg = error instanceof Error ? error.message : String(error);
+        console.error(`✗ 失败: ${name} - ${errorMsg}\n`);
+        return { success: false, name, error: errorMsg };
+      }
+    };
+
+    // 并行处理
+    const results: Array<{ success: boolean; name: string; error?: string }> = [];
+
+    for (let i = 0; i < pdfPaths.length; i += CONFIG.parallel.maxConcurrent) {
+      const batch = pdfPaths.slice(i, i + CONFIG.parallel.maxConcurrent);
+      const batchPromises = batch.map((pdfPath, batchIndex) =>
+        processOne(pdfPath, i + batchIndex)
+      );
+      const batchResults = await Promise.all(batchPromises);
+      results.push(...batchResults);
+    }
+
+    // 汇总
+    const succeeded = results.filter(r => r.success).length;
+    const failed = results.filter(r => !r.success);
+
+    console.log(`========== 批量提取完成 ==========`);
+    console.log(`成功: ${succeeded}/${pdfPaths.length}`);
+
+    if (failed.length > 0) {
+      console.log(`\n失败的文件:`);
+      failed.forEach(f => console.log(`  - ${f.name}: ${f.error}`));
+    }
+  }
+}
+
+// ==================== 命令行入口 ====================
+
+function parseArgs(args: string[]): {
+  pdfPaths: string[];
+  options: {
+    outputDir: string;
+    batch: boolean;
+    json: boolean;
+  };
+} {
+  const result = {
+    pdfPaths: [] as string[],
+    options: {
+      outputDir: "extracted",
+      batch: false,
+      json: false,
+    },
+  };
+
+  let i = 0;
+  while (i < args.length) {
+    const arg = args[i];
+
+    if (arg === "--output" || arg === "-o") {
+      result.options.outputDir = args[++i] || "extracted";
+    } else if (arg === "--batch" || arg === "-b") {
+      result.options.batch = true;
+    } else if (arg === "--json") {
+      result.options.json = true;
+    } else if (!arg.startsWith("-")) {
+      result.pdfPaths.push(arg);
+    }
+
+    i++;
+  }
+
+  return result;
 }
 
 async function main() {
   const args = process.argv.slice(2);
 
   if (args.length === 0) {
-    console.error("用法:");
-    console.error("  npm run pdf <pdf文件路径> [命令] [参数]");
-    console.error("\n命令:");
-    console.error("  summary    - 提取摘要和关键信息");
-    console.error("  citations  - 提取参考文献");
-    console.error("  tables     - 提取表格和图表");
-    console.error("  question   - 回答问题（需要额外参数：问题内容）");
-    console.error("  all        - 执行所有分析（默认）");
-    console.error("\n示例:");
-    console.error("  npm run pdf paper.pdf summary");
-    console.error('  npm run pdf paper.pdf question "这篇论文的主要贡献是什么？"');
-    process.exit(1);
+    console.log(`
+PDF 文本提取工具
+================
+
+用法:
+  npm run pdf <pdf文件路径> [选项]
+
+选项:
+  --output, -o <目录>   输出目录（默认: extracted）
+  --batch, -b           批量处理模式（支持通配符）
+  --json                只输出 JSON 到控制台（不保存文件）
+
+示例:
+  npm run pdf paper.pdf
+  npm run pdf paper.pdf -o results
+  npm run pdf paper.pdf --json
+  npm run pdf "papers/*.pdf" --batch
+
+输出文件:
+  extracted/<pdf名称>/
+  ├── content.txt      # 纯文本内容（Claude Code 可读取分析）
+  ├── extracted.json   # 完整提取结果
+  └── info.md          # 元数据摘要
+`);
+    process.exit(0);
   }
 
-  const pdfPath = args[0];
-  const command = args[1] || "all";
-  const analyzer = new PDFAnalyzer(pdfPath);
+  const parsed = parseArgs(args);
 
   try {
-    await analyzer.loadPDF();
+    // 批量模式
+    if (parsed.options.batch) {
+      let pdfFiles: string[] = [];
 
-    switch (command) {
-      case "summary": {
-        const result = await analyzer.extractSummary();
-        console.log("========== 文献摘要 ==========\n");
-        console.log(`标题: ${result.title}\n`);
-        console.log(`摘要:\n${result.abstract}\n`);
-        console.log(`关键发现:`);
-        result.keyFindings.forEach((f, i) => console.log(`  ${i + 1}. ${f}`));
-        console.log(`\n研究方法:\n${result.methodology}\n`);
-        console.log(`结论:\n${result.conclusions}\n`);
-        console.log(`关键词: ${result.keywords.join(", ")}`);
-        break;
+      for (const pattern of parsed.pdfPaths) {
+        const matches = await glob(pattern, { absolute: true });
+        pdfFiles = pdfFiles.concat(matches.filter(f => f.endsWith(".pdf")));
       }
 
-      case "citations": {
-        const citations = await analyzer.extractCitations();
-        console.log(`========== 参考文献 (共 ${citations.length} 条) ==========\n`);
-        citations.forEach((c, i) => {
-          console.log(`[${i + 1}] ${c.text}`);
-          if (c.authors) console.log(`    作者: ${c.authors.join(", ")}`);
-          if (c.year) console.log(`    年份: ${c.year}`);
-          if (c.title) console.log(`    标题: ${c.title}`);
-          console.log();
-        });
-        break;
-      }
-
-      case "tables": {
-        const items = await analyzer.extractTablesAndFigures();
-        console.log(`========== 表格和图表 (共 ${items.length} 个) ==========\n`);
-        items.forEach((item, i) => {
-          console.log(`[${i + 1}] ${item.type === "table" ? "表格" : "图表"}: ${item.caption || "无标题"}`);
-          if (item.pageNumber) console.log(`    页码: ${item.pageNumber}`);
-          console.log(`    内容: ${item.content}`);
-          if (item.analysis) console.log(`    分析: ${item.analysis}`);
-          console.log();
-        });
-        break;
-      }
-
-      case "question": {
-        const question = args.slice(2).join(" ");
-        if (!question) {
-          console.error("错误: 请提供问题内容");
-          process.exit(1);
-        }
-        const result = await analyzer.answerQuestion(question);
-        console.log("========== 问答结果 ==========\n");
-        console.log(`问题: ${result.question}\n`);
-        console.log(`答案:\n${result.answer}\n`);
-        console.log(`置信度: ${result.confidence}\n`);
-        console.log("支持证据:");
-        result.sources.forEach((s, i) => console.log(`  ${i + 1}. ${s}`));
-        break;
-      }
-
-      case "all": {
-        const results = await analyzer.analyzeAll();
-
-        console.log("\n========== 文献摘要 ==========\n");
-        console.log(`标题: ${results.summary.title}\n`);
-        console.log(`摘要:\n${results.summary.abstract}\n`);
-
-        console.log(`\n========== 参考文献 (共 ${results.citations.length} 条) ==========\n`);
-        results.citations.slice(0, 5).forEach((c, i) => {
-          console.log(`[${i + 1}] ${c.text.slice(0, 100)}...`);
-        });
-        if (results.citations.length > 5) {
-          console.log(`... 以及其他 ${results.citations.length - 5} 条引用`);
-        }
-
-        console.log(`\n========== 表格和图表 (共 ${results.tablesAndFigures.length} 个) ==========\n`);
-        results.tablesAndFigures.forEach((item, i) => {
-          console.log(`[${i + 1}] ${item.type === "table" ? "表格" : "图表"}: ${item.caption || "无标题"}`);
-        });
-        break;
-      }
-
-      default:
-        console.error(`未知命令: ${command}`);
+      if (pdfFiles.length === 0) {
+        console.error("错误: 未找到匹配的 PDF 文件");
         process.exit(1);
+      }
+
+      await PDFExtractor.batchExtract(pdfFiles, parsed.options.outputDir);
+      return;
     }
 
-    console.log("\n✓ 分析完成");
+    // 单文件模式
+    const pdfPath = parsed.pdfPaths[0];
+    if (!pdfPath) {
+      console.error("错误: 请提供 PDF 文件路径");
+      process.exit(1);
+    }
+
+    const extractor = new PDFExtractor(pdfPath);
+    const result = await extractor.extract();
+
+    // JSON 模式：只输出到控制台
+    if (parsed.options.json) {
+      console.log(JSON.stringify(result, null, 2));
+      return;
+    }
+
+    // 保存到文件
+    await extractor.saveToFile(result, parsed.options.outputDir);
+
+    console.log(`\n✓ 提取完成`);
+    console.log(`\n提示: Claude Code 可以读取 extracted/<名称>/content.txt 来分析内容`);
+
   } catch (error) {
     console.error("\n✗ 错误:", error instanceof Error ? error.message : String(error));
     process.exit(1);
@@ -423,4 +354,4 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   main();
 }
 
-export { PDFAnalyzer, SummaryResult, Citation, TableOrFigure, QuestionAnswer };
+export { PDFExtractor, ExtractResult, PDFMetadata };
