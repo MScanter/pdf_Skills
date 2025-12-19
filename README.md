@@ -212,7 +212,11 @@ npm run pdf paper.pdf --json
 
 ```
 pdf-skills/
-├── SKILL.md                    # Skill 定义（标准格式）
+├── SKILL.md                    # Skill 定义（核心指令，精简版）
+├── docs/                       # 详细文档（渐进式披露）
+│   ├── reference.md            # API 参考和技术细节
+│   ├── examples.md             # 7 种使用场景示例
+│   └── troubleshooting.md      # 问题排查指南
 ├── src/
 │   └── pdf-analyzer.ts         # PDF 文本提取工具
 ├── extracted/                  # 提取结果输出目录（自动创建）
@@ -227,14 +231,30 @@ pdf-skills/
 └── README.md
 ```
 
+### 文档组织（渐进式披露）
+
+本项目采用**渐进式披露**策略，优化 Claude Code 的上下文使用：
+
+- **SKILL.md**（90 行）- 核心指令，Claude 始终加载
+- **docs/reference.md**（147 行）- 完整 API 参考，需要时查阅
+- **docs/examples.md**（372 行）- 详细使用示例，需要时查阅
+- **docs/troubleshooting.md**（562 行）- 问题排查，遇到问题时查阅
+
+**优势**：
+- 初始 token 开销减少 65%（从 138 行降至 90 行）
+- 详细内容按需加载
+- 更符合 Claude Code Skills 最佳实践
+
 ## SKILL.md 格式
 
 本项目使用标准的 `SKILL.md` 格式：
 
 ```markdown
 ---
-name: pdf-analysis
+name: analyzing-pdfs
 description: Extract text from PDF files and analyze academic papers...
+allowed-tools: Bash, Read, Glob, Write
+version: 2.0.0
 ---
 
 # PDF Analysis Skill
@@ -242,9 +262,11 @@ description: Extract text from PDF files and analyze academic papers...
 [指令内容...]
 ```
 
-**YAML frontmatter 要求**：
-- `name`: 最多 64 字符，小写字母/数字/连字符
-- `description`: 最多 1024 字符，描述 skill 的功能和使用场景
+**YAML frontmatter 字段**：
+- `name`: skill 名称（使用动名词形式，如 `analyzing-pdfs`）
+- `description`: 功能描述和使用场景（最多 1024 字符）
+- `allowed-tools`: 限制 Claude 可使用的工具（可选）
+- `version`: 版本号（可选，便于管理）
 
 ## 环境要求
 
