@@ -1,15 +1,13 @@
-# API 参考文档
+# Reference
 
-## 工具命令
-
-### 基本用法
+## Commands
 
 ```bash
-# 提取单个 PDF
+# 单个 PDF
 npm run pdf <pdf路径>
 
 # 批量提取
-npm run pdf "papers/*.pdf" --batch
+npm run pdf "路径/*.pdf" --batch
 
 # 指定输出目录
 npm run pdf <pdf路径> -o <输出目录>
@@ -18,30 +16,33 @@ npm run pdf <pdf路径> -o <输出目录>
 npm run pdf <pdf路径> --json
 ```
 
-### 命令参数
+## Options
 
 | 参数 | 简写 | 说明 | 默认值 |
 |------|------|------|--------|
-| `--output` | `-o` | 指定输出目录 | `extracted` |
-| `--batch` | `-b` | 批量处理模式，支持通配符 | - |
-| `--json` | - | 只输出 JSON 到控制台，不保存文件 | - |
+| `--output` | `-o` | 输出目录 | `extracted` |
+| `--batch` | `-b` | 批量模式（支持通配符） | - |
+| `--json` | - | 仅输出 JSON，不保存文件 | - |
 
-### 输出文件结构
+## Output
+
+默认输出到 `extracted/`：
 
 ```
 extracted/<pdf名称>/
-├── content.txt      # 纯文本内容（你应该读取这个来分析）
-├── extracted.json   # 完整提取结果
-└── info.md          # 元数据摘要
+├── content.txt
+├── extracted.json
+└── info.md
 ```
 
-#### content.txt
-- 纯文本格式
-- UTF-8 编码
-- 包含 PDF 所有文本内容
-- 最适合 Claude 直接读取分析
+如果同名文件冲突，会自动追加短 hash：
 
-#### extracted.json
+```
+extracted/<pdf名称>-<hash>/
+```
+
+`extracted.json` 结构示例：
+
 ```json
 {
   "pdfPath": "/path/to/paper.pdf",
@@ -53,95 +54,25 @@ extracted/<pdf名称>/
   },
   "text": "完整文本内容...",
   "hash": "abc123456789",
-  "extractedAt": "2023-12-19T10:00:00.000Z"
+  "extractedAt": "2023-12-19T10:00:00.000Z",
+  "source": {
+    "path": "/path/to/paper.pdf",
+    "size": 123456,
+    "mtimeMs": 1700000000000
+  }
 }
 ```
 
-#### info.md
-Markdown 格式的元数据摘要，包含：
-- 文件名
-- 页数
-- 字符数
-- Hash 值（用于缓存）
-- 提取时间
-- 标题、作者（如果有）
+说明：
+- `hash` 为文件内容哈希（用于展示，不作为缓存键）
+- `source` 用于缓存校验
 
-## 技术细节
+## Cache
 
-### 缓存机制
+- 缓存按文件路径 hash 存储：`.cache/<path-hash>/extracted.json`
+- 当文件 `size/mtimeMs` 未变化时直接使用缓存，跳过解析
 
-工具使用基于内容 MD5 的缓存系统：
+## Limitations
 
-1. **Hash 计算**：提取 PDF 文本后，计算内容的 MD5 hash（前 12 位）
-2. **缓存位置**：`.cache/<hash>/extracted.json`
-3. **缓存命中**：同一 PDF 再次提取时，直接返回缓存结果
-4. **缓存失效**：PDF 内容改变时，hash 变化，自动重新提取
-
-### 批量处理
-
-批量模式的特性：
-- **并行度**：最多同时处理 3 个 PDF
-- **错误处理**：单个文件失败不影响其他文件
-- **进度显示**：显示 `[当前/总数]` 进度
-- **结果汇总**：完成后显示成功/失败统计
-
-### 性能数据
-
-| PDF 大小 | 页数 | 提取时间 | 缓存命中时间 |
-|---------|------|----------|-------------|
-| 小文件 | < 10 页 | 0.5-1 秒 | < 0.1 秒 |
-| 中等文件 | 10-50 页 | 1-3 秒 | < 0.1 秒 |
-| 大文件 | > 50 页 | 3-10 秒 | < 0.1 秒 |
-
-## 环境配置
-
-### 系统要求
-
-- Node.js >= 18
-- npm 或 yarn
-- 支持的操作系统：macOS、Linux、Windows
-
-### 依赖项
-
-- **pdf-parse**: PDF 文本解析库
-- **glob**: 文件匹配和批量处理
-- **tsx**: TypeScript 直接执行
-
-### 安装
-
-```bash
-# 克隆或复制 skill 到本地
-cd pdf_Skills
-
-# 安装依赖
-npm install
-
-# 测试运行
-npm run pdf test.pdf
-```
-
-## 限制和注意事项
-
-### PDF 格式支持
-
-- ✅ 支持标准文本 PDF
-- ✅ 支持嵌入字体的 PDF
-- ⚠️ 扫描版 PDF（纯图片）提取效果受限
-- ⚠️ 加密/受保护的 PDF 可能无法提取
-
-### 大文件处理
-
-对于超大 PDF（> 100 页 / > 50MB）：
-1. 提取时间较长（10+ 秒）
-2. 文本内容可能很大（> 100KB）
-3. 建议分段分析，避免占用过多上下文
-
-### 文本质量
-
-提取的文本质量取决于：
-- PDF 的原始质量
-- 文本编码方式
-- 字体嵌入情况
-- 页面布局复杂度
-
-对于复杂排版（多栏、表格、公式），文本顺序可能不完全准确。
+- 扫描版 PDF 需 OCR 才能提取文字
+- 复杂排版可能影响文本顺序

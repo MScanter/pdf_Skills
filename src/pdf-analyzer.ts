@@ -27,49 +27,84 @@ interface PDFMetadata {
   creationDate?: Date;
 }
 
+interface PDFSourceInfo {
+  path: string;
+  size: number;
+  mtimeMs: number;
+}
+
 interface ExtractResult {
   pdfPath: string;
   metadata: PDFMetadata;
   text: string;
   hash: string;
   extractedAt: string;
+  source: PDFSourceInfo;
 }
 
 // ==================== PDF 提取器 ====================
 
 class PDFExtractor {
   private pdfPath: string;
-  private pdfContent: string = "";
-  private pdfMetadata: PDFMetadata = { pages: 0 };
-  private pdfHash: string = "";
+  private cacheKey: string;
 
   constructor(pdfPath: string) {
     this.pdfPath = path.resolve(pdfPath);
+    this.cacheKey = this.computeHash(this.pdfPath);
   }
 
   // ==================== 缓存功能 ====================
 
-  private computeHash(content: string): string {
-    return crypto.createHash("md5").update(content).digest("hex").slice(0, 12);
+  private computeHash(data: string | Buffer): string {
+    return crypto.createHash("md5").update(data).digest("hex").slice(0, 12);
   }
 
   private getCachePath(): string {
-    const cacheDir = path.join(CONFIG.cache.dir, this.pdfHash);
+    const cacheDir = path.join(CONFIG.cache.dir, this.cacheKey);
     return path.join(cacheDir, "extracted.json");
   }
 
-  private checkCache(): ExtractResult | null {
-    if (!CONFIG.cache.enabled || !this.pdfHash) return null;
+  private getSourceInfo(): PDFSourceInfo {
+    const stat = fs.statSync(this.pdfPath);
+    return {
+      path: this.pdfPath,
+      size: stat.size,
+      mtimeMs: stat.mtimeMs,
+    };
+  }
+
+  private checkCache(sourceInfo: PDFSourceInfo): ExtractResult | null {
+    if (!CONFIG.cache.enabled) return null;
 
     const cachePath = this.getCachePath();
-    if (fs.existsSync(cachePath)) {
-      try {
-        const cached = JSON.parse(fs.readFileSync(cachePath, "utf-8"));
-        console.log(`📦 使用缓存 (hash: ${this.pdfHash})`);
+    if (!fs.existsSync(cachePath)) return null;
+
+    try {
+      const cached = JSON.parse(fs.readFileSync(cachePath, "utf-8")) as ExtractResult;
+      const cachedPath =
+        typeof cached?.source?.path === "string"
+          ? cached.source.path
+          : typeof cached?.pdfPath === "string"
+            ? cached.pdfPath
+            : null;
+      const cachedSize =
+        typeof cached?.source?.size === "number" ? cached.source.size : null;
+      const cachedMtimeMs =
+        typeof cached?.source?.mtimeMs === "number"
+          ? cached.source.mtimeMs
+          : null;
+
+      if (
+        cachedPath &&
+        path.resolve(cachedPath) === this.pdfPath &&
+        cachedSize === sourceInfo.size &&
+        cachedMtimeMs === sourceInfo.mtimeMs
+      ) {
+        console.log(`📦 使用缓存 (path: ${path.basename(this.pdfPath)})`);
         return cached;
-      } catch {
-        return null;
       }
+    } catch {
+      return null;
     }
     return null;
   }
@@ -77,7 +112,7 @@ class PDFExtractor {
   private saveCache(result: ExtractResult): void {
     if (!CONFIG.cache.enabled) return;
 
-    const cacheDir = path.join(CONFIG.cache.dir, this.pdfHash);
+    const cacheDir = path.join(CONFIG.cache.dir, this.cacheKey);
     if (!fs.existsSync(cacheDir)) {
       fs.mkdirSync(cacheDir, { recursive: true });
     }
@@ -97,34 +132,36 @@ class PDFExtractor {
       throw new Error(`PDF 文件不存在: ${this.pdfPath}`);
     }
 
+    const sourceInfo = this.getSourceInfo();
+
+    // 检查缓存（在解析前）
+    const cached = this.checkCache(sourceInfo);
+    if (cached) return cached;
+
     console.log(`正在加载 PDF: ${this.pdfPath}`);
 
     // 读取 PDF
     const dataBuffer = fs.readFileSync(this.pdfPath);
     const data = await pdfParse(dataBuffer);
 
-    this.pdfContent = data.text;
-    this.pdfHash = this.computeHash(this.pdfContent);
-    this.pdfMetadata = {
+    const fileHash = this.computeHash(dataBuffer);
+    const metadata: PDFMetadata = {
       title: data.info?.Title,
       author: data.info?.Author,
       pages: data.numpages,
       creationDate: data.info?.CreationDate,
     };
 
-    console.log(`PDF 加载完成: ${this.pdfMetadata.pages} 页, ${this.pdfContent.length} 字符, hash: ${this.pdfHash}`);
-
-    // 检查缓存
-    const cached = this.checkCache();
-    if (cached) return cached;
+    console.log(`PDF 加载完成: ${metadata.pages} 页, ${data.text.length} 字符, hash: ${fileHash}`);
 
     // 构建结果
     const result: ExtractResult = {
       pdfPath: this.pdfPath,
-      metadata: this.pdfMetadata,
-      text: this.pdfContent,
-      hash: this.pdfHash,
+      metadata,
+      text: data.text,
+      hash: fileHash,
       extractedAt: new Date().toISOString(),
+      source: sourceInfo,
     };
 
     // 保存缓存
@@ -136,9 +173,44 @@ class PDFExtractor {
   /**
    * 保存提取结果到文件
    */
+  private resolveOutputPath(outputDir: string): string {
+    const pdfBasename = path.basename(this.pdfPath, ".pdf");
+    const basePath = path.join(outputDir, pdfBasename);
+    const fallbackPath = path.join(outputDir, `${pdfBasename}-${this.cacheKey}`);
+
+    if (!fs.existsSync(basePath)) {
+      return basePath;
+    }
+
+    const existingJson = path.join(basePath, "extracted.json");
+    if (!fs.existsSync(existingJson)) {
+      return fallbackPath;
+    }
+
+    try {
+      const existing = JSON.parse(fs.readFileSync(existingJson, "utf-8")) as ExtractResult;
+      const existingPath =
+        typeof existing?.source?.path === "string"
+          ? existing.source.path
+          : typeof existing?.pdfPath === "string"
+            ? existing.pdfPath
+            : null;
+      if (existingPath && path.resolve(existingPath) === this.pdfPath) {
+        return basePath;
+      }
+    } catch {
+      return fallbackPath;
+    }
+
+    return fallbackPath;
+  }
+
+  /**
+   * 保存提取结果到文件
+   */
   async saveToFile(result: ExtractResult, outputDir: string): Promise<string[]> {
     const pdfBasename = path.basename(this.pdfPath, ".pdf");
-    const outputPath = path.join(outputDir, pdfBasename);
+    const outputPath = this.resolveOutputPath(outputDir);
 
     if (!fs.existsSync(outputPath)) {
       fs.mkdirSync(outputPath, { recursive: true });
@@ -162,9 +234,10 @@ class PDFExtractor {
     const mdPath = path.join(outputPath, "info.md");
     let md = `# ${pdfBasename}\n\n`;
     md += `**文件**: ${path.basename(result.pdfPath)}\n`;
+    md += `**路径**: ${result.pdfPath}\n`;
     md += `**页数**: ${result.metadata.pages}\n`;
     md += `**字符数**: ${result.text.length}\n`;
-    md += `**Hash**: ${result.hash}\n`;
+    md += `**文件哈希**: ${result.hash}\n`;
     md += `**提取时间**: ${new Date(result.extractedAt).toLocaleString("zh-CN")}\n`;
     if (result.metadata.title) md += `**标题**: ${result.metadata.title}\n`;
     if (result.metadata.author) md += `**作者**: ${result.metadata.author}\n`;
@@ -297,6 +370,8 @@ PDF 文本提取工具
   ├── content.txt      # 纯文本内容（Claude Code 可读取分析）
   ├── extracted.json   # 完整提取结果
   └── info.md          # 元数据摘要
+
+  同名冲突会自动追加短 hash
 `);
     process.exit(0);
   }
@@ -342,7 +417,7 @@ PDF 文本提取工具
     await extractor.saveToFile(result, parsed.options.outputDir);
 
     console.log(`\n✓ 提取完成`);
-    console.log(`\n提示: Claude Code 可以读取 extracted/<名称>/content.txt 来分析内容`);
+    console.log(`\n提示: Claude Code 可读取 extracted/<名称>/content.txt（同名冲突会带 hash）`);
 
   } catch (error) {
     console.error("\n✗ 错误:", error instanceof Error ? error.message : String(error));
